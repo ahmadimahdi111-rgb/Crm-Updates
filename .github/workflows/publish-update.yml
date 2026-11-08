@@ -1,0 +1,70 @@
+name: Publish CRM update package
+on:
+  push:
+    branches: [main]
+    paths: ['updates/**', '.github/workflows/publish-update.yml']
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: crm-release-publisher
+  cancel-in-progress: false
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Select the latest signed update
+        shell: python
+        run: |
+          import json, os, re
+          from pathlib import Path
+          candidates=[]
+          for path in Path('updates').glob('*/release.json'):
+              meta=json.loads(path.read_text())
+              version=meta.get('version','')
+              if not re.fullmatch(r'\d+\.\d+\.\d+(?:-test)?',version):
+                  raise RuntimeError('Invalid release version')
+              numbers=tuple(map(int,version.split('-')[0].split('.')))
+              candidates.append((numbers,version,path.parent))
+          if not candidates:
+              raise RuntimeError('No update release manifests found')
+          _,version,directory=max(candidates)
+          with open(os.environ['GITHUB_ENV'],'a') as out:
+              out.write(f'VERSION={version}\nTAG=v{version}\nBUNDLE_DIR={directory.as_posix()}\n')
+      - name: Rebuild archive from encoded repository parts
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! -f "$BUNDLE_DIR/update.zip" ]]; then
+            shopt -s nullglob
+            parts=("$BUNDLE_DIR"/update.zip.b64.part*)
+            if [[ ${#parts[@]} -eq 0 ]]; then
+              echo "update.zip or encoded payload parts are missing" >&2
+              exit 1
+            fi
+            cat "${parts[@]}" | base64 --decode > "$BUNDLE_DIR/update.zip"
+          fi
+      - name: Verify and publish update assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib, json, os, zipfile
+          from pathlib import Path
+          directory=Path(os.environ['BUNDLE_DIR'])
+          meta=json.loads((directory/'release.json').read_text())
+          assert hashlib.sha256((directory/'update.zip').read_bytes()).hexdigest()==meta['sha256'], 'SHA-256 mismatch'
+          with zipfile.ZipFile(directory/'update.zip') as archive:
+              assert archive.testzip() is None, 'Corrupt ZIP archive'
+              assert json.loads(archive.read('update.json'))['version']==meta['version'], 'Package version mismatch'
+          PY
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo 'Release already exists; leaving published assets unchanged.'
+            exit 0
+          fi
+          flags=()
+          if [[ "$VERSION" == *-test ]]; then flags+=(--prerelease); else flags+=(--latest); fi
+          gh release create "$TAG" "$BUNDLE_DIR/update.zip" "$BUNDLE_DIR/release.json" "$BUNDLE_DIR/release.sig" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "CRM Kabei $VERSION" --notes-file "$BUNDLE_DIR/NOTES_FA.txt" "${flags[@]}"
